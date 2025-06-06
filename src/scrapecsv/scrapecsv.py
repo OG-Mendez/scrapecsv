@@ -8,73 +8,124 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
-import time  # For rate limiting
+from fake_useragent import UserAgent
+import time
+import random
 
 
 def scrape_to_csv(
         urls: List[str], tags: List[str], write_to_csv: bool = True, output_file: str = "scraped_data.csv",
-        return_structured_data: bool = False, headless: bool = True):
+        return_structured_data: bool = False, headless: bool = True, proxies: List[str] = None,
+        max_retries: int = 3):
     """
-    Scrapes data from multiple URLs using Selenium and BeautifulSoup, returns a Pandas DataFrame,
-    optionally saves it to a CSV file and optionally returns the structured data.
+    Scrapes data from multiple URLs using rotating proxies and randomized user-agents.
+    Includes retry logic for robustness. Returns DataFrame and optionally writes to CSV.
 
     Args:
         urls: A list of URLs to scrape.
         tags: A list of CSS selectors to extract data from.
-        write_to_csv: Write returned data into a CSV file.
-        output_file: The name of the CSV file to save the data to.
-        return_structured_data: If True, returns the scraped data in its original nested list format.
-        headless: If True, runs Chrome in headless mode (no GUI).
+        write_to_csv: Save results to CSV.
+        output_file: CSV file path.
+        return_structured_data: Print nested output in addition to DataFrame.
+        headless: Use headless Chrome.
+        proxies: List of proxy servers to rotate through (http://ip:port).
+        max_retries: Number of retries per URL if scraping fails.
     """
-    # Setup Chrome options
-    options = Options()
-    if headless:
-        options.add_argument("--headless")  # Run in headless mode (no GUI)
-
-    # Initialize Chrome with webdriver-manager
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-
+    ua = UserAgent()
     results = []
 
-    try:
-        for url in urls:
-            driver.get(url)
-            print(f"Scraping: {url}")
-            row = {'url': url}
+    for url in urls:
+        print(f"Scraping: {url}")
+        success = False
+
+        for attempt in range(max_retries):
+            print(f"Attempt {attempt + 1}/{max_retries}")
+
+            # Select user-agent and proxy
+            user_agent = ua.random
+            proxy = random.choice(proxies) if proxies and len(proxies) > 0 else None
+
+            # Setup Chrome options
+            options = Options()
+            if headless:
+                options.add_argument("--headless=new")
+                options.add_argument("--disable-gpu")
+                options.add_argument("--window-size=1920x1080")
+
+            options.add_argument(f'user-agent={user_agent}')
+            if proxy:
+                print(f"    Using proxy: {proxy}")
+                options.add_argument(f'--proxy-server={proxy}')
+
+            # Anti-detection flags
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
+
+            # Start WebDriver
+            service = Service(ChromeDriverManager().install())
+            driver = None
+            try:
+                driver = webdriver.Chrome(service=service, options=options)
+                driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                    "source": """
+                       Object.defineProperty(navigator, 'webdriver', {
+                         get: () => undefined
+                       })
+                    """
+                })
+
+                driver.get(url)
+
+                # Wait and parse
+                row = {'url': url}
+                for tag in tags:
+                    try:
+                        WebDriverWait(driver, 10).until(
+                            EC.presence_of_all_elements_located((By.CSS_SELECTOR, tag))
+                        )
+                        soup = BeautifulSoup(driver.page_source, 'html.parser')
+                        elements = soup.select(tag)
+                        row[tag] = [el.get_text(strip=True) for el in elements]
+                    except Exception as e:
+                        print(f"    Error with tag '{tag}': {e}")
+                        row[tag] = []
+
+                results.append(row)
+                success = True
+                break
+
+            except Exception as e:
+                print(f"Attempt failed: {e}")
+                time.sleep(random.uniform(2, 4))  # Backoff delay
+
+            finally:
+                if driver:
+                    driver.quit()
+
+        if not success:
+            print(f"Skipping {url} after {max_retries} failed attempts")
+            failed_row = {'url': url}
             for tag in tags:
-                try:
-                    # Wait for elements to be present (dynamic content)
-                    WebDriverWait(driver, 10).until(
-                        EC.presence_of_all_elements_located((By.CSS_SELECTOR, tag))
-                    )
-                    soup = BeautifulSoup(driver.page_source, 'html.parser')
-                    elements = soup.select(tag)
-                    row[tag] = [el.get_text(strip=True) for el in elements]
-                except Exception as e:
-                    print(f"Error finding elements with tag '{tag}' on {url}: {e}")
-                    row[tag] = []
-            results.append(row)
-            time.sleep(1)
+                failed_row[tag] = ['<FAILED>']
+            results.append(failed_row)
 
-        # Grouped by URL and tag, stored as lists of strings
-        grouped_data = []
-        for row in results:
-            grouped_row = {'url': row['url']}
-            for tag in tags:
-                # Join multiple elements into a single string (separated by a comma)
-                grouped_row[tag] = ', '.join(row[tag])
-            grouped_data.append(grouped_row)
+        time.sleep(random.uniform(1, 4))
 
-        df = pd.DataFrame(grouped_data)
-        if write_to_csv:
-            df.to_csv(output_file, index=False)
-            print(f"Data written to {output_file}")
-        else:
-            print(df)
+    # Flatten data
+    grouped_data = []
+    for row in results:
+        grouped_row = {'url': row['url']}
+        for tag in tags:
+            grouped_row[tag] = ', '.join(row.get(tag, []))
+        grouped_data.append(grouped_row)
 
-        if return_structured_data:
-            print(results)
+    df = pd.DataFrame(grouped_data)
+    if write_to_csv:
+        df.to_csv(output_file, index=False)
+        print(f"Data written to {output_file}")
+    else:
+        print(df)
 
-    finally:
-        driver.quit()
+    if return_structured_data:
+        print("Raw structured data:")
+        print(results)
